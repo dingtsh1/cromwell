@@ -219,8 +219,8 @@ class WorkflowDockerLookupActor private[workflow](workflowId: WorkflowId,
         val updatedData = data.copy(hashRequests = data.hashRequests - request.dockerImageID)
         stay using updatedData
       case None =>
-        val message = s"Unable to find requesters for failed lookup of Docker image '${request.dockerImageID}'"
-        fail(new RuntimeException(message, failureResponse.reason))
+        val updatedData = data.copy(hashRequests = data.hashRequests)
+        stay using updatedData
     }
   }
 

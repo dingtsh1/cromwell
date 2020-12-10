@@ -15,7 +15,7 @@ import akka.stream.scaladsl.Flow
 import akka.util.ByteString
 import com.google.gson.{JsonObject, JsonParser}
 import cromwell.backend.BackendJobLifecycleActor
-import cromwell.backend.async.{AbortedExecutionHandle, ExecutionHandle, FailedNonRetryableExecutionHandle, FailedRetryableExecutionHandle, PendingExecutionHandle}
+import cromwell.backend.async.{AbortedExecutionHandle, ExecutionHandle, FailedNonRetryableExecutionHandle, FailedRetryableExecutionHandle, PendingExecutionHandle, RetryWithMoreMemory, ReturnCodeIsNotAnInt, StderrNonEmpty, WrongReturnCode}
 import cromwell.backend.standard.{StandardAsyncExecutionActor, StandardAsyncExecutionActorParams, StandardAsyncJob}
 import cromwell.core.path.{DefaultPathBuilder, Path}
 import cromwell.core.retry.{Retry, SimpleExponentialBackoff}
@@ -26,13 +26,14 @@ import common.collections.EnhancedCollections._
 import scala.concurrent.{Await, Future}
 import scala.concurrent.duration.{Duration, _}
 import scala.language.postfixOps
-import scala.util.{Failure, Success}
+import scala.util.{Failure, Success, Try}
 import skuber.batch.Job
 import skuber.json.batch.format._
 import wdl.draft2.model.FullyQualifiedName
 import skuber.json.PlayJsonSupportForAkkaHttp._
 import cromwell.backend.impl.vk.VkResponseJsonFormatter._
 import cromwell.core.CromwellFatalExceptionMarker
+import org.apache.commons.lang3.exception.ExceptionUtils
 
 sealed trait VkRunStatus {
   def isTerminal: Boolean
@@ -91,8 +92,8 @@ class VkAsyncBackendJobExecutionActor(override val standardParams: StandardAsync
 
   private val namespace = vkConfiguration.namespace
 
-  private val apiServerUrl = s"https://cci.${vkConfiguration.region}.myhuaweicloud.com"
-
+//  private val apiServerUrl = s"https://cci.${vkConfiguration.region}.myhuaweicloud.com"
+  private val apiServerUrl = vkConfiguration.cciURL
   override lazy val jobTag: String = jobDescriptor.key.tag
 
   override lazy val jobShell: String = workflowDescriptor.workflowOptions.getOrElse("system.job-shell", configurationDescriptor.globalConfig.getString("system.job-shell"))
@@ -457,6 +458,99 @@ class VkAsyncBackendJobExecutionActor(override val standardParams: StandardAsync
     case _: CromwellFatalExceptionMarker => true
     case e: ExecutionException => Option(e.getCause).exists(isFatal)
     case _ => false
+  }
+
+  override def handleExecutionResult(status: StandardAsyncRunState,
+                            oldHandle: StandardAsyncPendingExecutionHandle): Future[ExecutionHandle] = {
+
+    def memoryRetryRC: Future[Boolean] = {
+      def returnCodeAsBoolean(codeAsOption: Option[String]): Boolean = {
+        codeAsOption match {
+          case Some(codeAsString) =>
+            Try(codeAsString.trim.toInt) match {
+              case Success(code) => code match {
+                case StderrContainsRetryKeysCode => true
+                case _ => false
+              }
+              case Failure(e) =>
+                log.error(s"'CheckingForMemoryRetry' action exited with code '$codeAsString' which couldn't be " +
+                  s"converted to an Integer. Task will not be retried with double memory. Error: ${ExceptionUtils.getMessage(e)}")
+                false
+            }
+          case None => false
+        }
+      }
+
+      def readMemoryRetryRCFile(fileExists: Boolean): Future[Option[String]] = {
+        if (fileExists)
+          asyncIo.contentAsStringAsync(jobPaths.memoryRetryRC, None, failOnOverflow = false).map(Option(_))
+        else
+          Future.successful(None)
+      }
+
+      for {
+        fileExists <- asyncIo.existsAsync(jobPaths.memoryRetryRC)
+        retryCheckRCAsOption <- readMemoryRetryRCFile(fileExists)
+        retryWithMoreMemory = returnCodeAsBoolean(retryCheckRCAsOption)
+      } yield retryWithMoreMemory
+    }
+
+    val stderr = jobPaths.standardPaths.error
+    val stdout = jobPaths.standardPaths.output
+    val script = jobPaths.script
+    lazy val stderrAsOption: Option[Path] = Option(stderr)
+
+    val stderrSizeAndReturnCodeAndMemoryRetry = for {
+      returnCodeAsString <- asyncIo.contentAsStringAsync(jobPaths.returnCode, None, failOnOverflow = false)
+      // Only check stderr size if we need to, otherwise this results in a lot of unnecessary I/O that
+      // may fail due to race conditions on quickly-executing jobs.
+      stderrSize <- if (failOnStdErr) asyncIo.sizeAsync(stderr) else Future.successful(0L)
+      retryWithMoreMemory <- memoryRetryRC
+    } yield (stderrSize, returnCodeAsString, retryWithMoreMemory)
+
+    stderrSizeAndReturnCodeAndMemoryRetry flatMap {
+      case (stderrSize, returnCodeAsString, retryWithMoreMemory) =>
+        val tryReturnCodeAsInt = Try(returnCodeAsString.trim.toInt)
+
+        if (isDone(status)) {
+          syncOutput(stderr)
+          syncOutput(stdout)
+          syncOutput(script)
+          tryReturnCodeAsInt match {
+            case Success(returnCodeAsInt) if failOnStdErr && stderrSize.intValue > 0 =>
+              val executionHandle = Future.successful(FailedNonRetryableExecutionHandle(StderrNonEmpty(jobDescriptor.key.tag, stderrSize, stderrAsOption), Option(returnCodeAsInt), None))
+              retryElseFail(executionHandle)
+            case Success(returnCodeAsInt) if isAbort(returnCodeAsInt) =>
+              Future.successful(AbortedExecutionHandle)
+            case Success(returnCodeAsInt) if !continueOnReturnCode.continueFor(returnCodeAsInt) =>
+              val executionHandle = Future.successful(FailedNonRetryableExecutionHandle(WrongReturnCode(jobDescriptor.key.tag, returnCodeAsInt, stderrAsOption), Option(returnCodeAsInt), None))
+              retryElseFail(executionHandle)
+            case Success(returnCodeAsInt) if retryWithMoreMemory  =>
+              val executionHandle = Future.successful(FailedNonRetryableExecutionHandle(RetryWithMoreMemory(jobDescriptor.key.tag, stderrAsOption), Option(returnCodeAsInt), None))
+              retryElseFail(executionHandle, retryWithMoreMemory)
+            case Success(returnCodeAsInt) =>
+              handleExecutionSuccess(status, oldHandle, returnCodeAsInt)
+            case Failure(_) =>
+              Future.successful(FailedNonRetryableExecutionHandle(ReturnCodeIsNotAnInt(jobDescriptor.key.tag, returnCodeAsString, stderrAsOption), kvPairsToSave = None))
+          }
+        } else {
+          tryReturnCodeAsInt match {
+            case Success(returnCodeAsInt) if retryWithMoreMemory =>
+              val executionHandle = Future.successful(FailedNonRetryableExecutionHandle(RetryWithMoreMemory(jobDescriptor.key.tag, stderrAsOption), Option(returnCodeAsInt), None))
+              retryElseFail(executionHandle, retryWithMoreMemory)
+            case _ =>
+              val failureStatus = handleExecutionFailure(status, tryReturnCodeAsInt.toOption)
+              retryElseFail(failureStatus)
+          }
+        }
+    } recoverWith {
+      case exception =>
+        if (isDone(status)) Future.successful(FailedNonRetryableExecutionHandle(exception, kvPairsToSave = None))
+        else {
+          val failureStatus = handleExecutionFailure(status, None)
+          retryElseFail(failureStatus)
+        }
+    }
   }
 
 }

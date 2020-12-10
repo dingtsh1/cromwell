@@ -378,7 +378,8 @@ object Dependencies {
 
   val obsFileSystemDependencies = googleCloudDependencies ++ List(
     "com.github.pathikrit" %% "better-files" % betterFilesV,
-    "com.huawei.storage" % "esdk-obs-java" % "3.19.9",
+    //"com.huawei.storage" % "esdk-obs-java" % "3.19.9",
+    "com.huaweicloud" % "esdk-obs-java" % "3.20.4.2"
   )
 
   val statsDProxyDependencies = List(

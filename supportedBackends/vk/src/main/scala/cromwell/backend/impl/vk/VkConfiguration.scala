@@ -9,7 +9,7 @@ import cromwell.backend.BackendConfigurationDescriptor
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 import org.apache.http.client.methods.HttpPost
-import org.apache.http.conn.ssl.{SSLConnectionSocketFactory, TrustSelfSignedStrategy}
+import org.apache.http.conn.ssl.{NoopHostnameVerifier, SSLConnectionSocketFactory, TrustSelfSignedStrategy}
 import org.apache.http.entity.StringEntity
 import org.apache.http.impl.client.HttpClients
 import org.apache.http.ssl.SSLContextBuilder
@@ -26,11 +26,18 @@ class VkConfiguration(val configurationDescriptor: BackendConfigurationDescripto
   val accessKey = configurationDescriptor.backendConfig.getString("accessKey")
   val secretKey = configurationDescriptor.backendConfig.getString("secretKey")
   val runtimeConfig = configurationDescriptor.backendRuntimeAttributesConfig
-  val token = Token(accessKey, secretKey, region)
+  var iamURL = s"https://iam.${region}.myhuaweicloud.com"
+  var cciURL = s"https://cci.${region}.myhuaweicloud.com"
+
+  if(region == "cn-north-7"){
+    iamURL = "https://iam.cn-north-7.ulanqab.huawei.com"
+    cciURL = "https://cci.cn-north-7.myhuaweicloud.com"
+  }
+  val token = Token(accessKey, secretKey, region, iamURL)
 
 }
 
-final case class Token(accessKey: String, secretKey:String, region: String){
+final case class Token(accessKey: String, secretKey:String, region: String, iamURL: String){
 
   var value = ""
 
@@ -84,11 +91,6 @@ final case class Token(accessKey: String, secretKey:String, region: String){
 
     val projectName = region
 
-    val iamURL = if(projectName == "cn-north-7"){
-      "https://iam.myhuaweicloud.com"
-    } else {
-      s"https://iam.${projectName}.myhuaweicloud.com"
-    }
 
     val signedHeaders = "x-hws-date"
     val canonicalHeadersOut = "x-hws-date:" + signTime + "\n"
@@ -118,7 +120,10 @@ final case class Token(accessKey: String, secretKey:String, region: String){
 
     // http post
     val builder = SSLContextBuilder.create().loadTrustMaterial(null,new TrustSelfSignedStrategy())
-    val sslsf = new SSLConnectionSocketFactory(builder.build())
+    var sslsf = new SSLConnectionSocketFactory(builder.build())
+    if (region == "cn-north-7"){
+      sslsf = new SSLConnectionSocketFactory(builder.build(), NoopHostnameVerifier.INSTANCE)
+    }
     val httpclient = HttpClients.custom().setSSLSocketFactory(sslsf).build()
     val post = new HttpPost(iamURL + "/v3/auth/tokens")
     post.setHeader("X-Identity-Sign", signHeader)
